@@ -1,0 +1,72 @@
+name: odds
+on:
+  schedule:
+    - cron: '3,33 14-23,0-5 * * *'
+  workflow_dispatch:
+    inputs:
+      alts:
+        description: 'also fetch alternate ladders'
+        type: boolean
+        default: true
+permissions:
+  contents: write
+concurrency:
+  group: odds
+jobs:
+  pull:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: fetch odds
+        env:
+          ODDS_KEY: ${{ secrets.ODDS_API_KEY }}
+          ALTS: ${{ github.event_name == 'workflow_dispatch' && inputs.alts || false }}
+        run: |
+          set -uo pipefail
+          BOOKS="pinnacle,lowvig,betonlineag,bovada,draftkings,fanduel,betmgm,betrivers"
+          SPORTS="americanfootball_nfl americanfootball_ncaaf basketball_nba basketball_ncaab icehockey_nhl mma_mixed_martial_arts soccer_uefa_nations_league soccer_epl soccer_spain_la_liga soccer_italy_serie_a soccer_germany_bundesliga soccer_france_ligue_one"
+          mkdir -p boards
+          REM="?"
+          for S in $SPORTS; do
+            EV=$(curl -sS "https://api.the-odds-api.com/v4/sports/$S/events/?apiKey=$ODDS_KEY&dateFormat=iso")
+            N=$(printf '%s' "$EV" | python3 -c "
+import sys,json,datetime
+try: d=json.load(sys.stdin)
+except Exception: print(0); raise SystemExit
+if not isinstance(d,list): print(0); raise SystemExit
+now=datetime.datetime.now(datetime.timezone.utc); c=0
+for g in d:
+    try: t=datetime.datetime.fromisoformat(g['commence_time'].replace('Z','+00:00'))
+    except Exception: continue
+    if -4*3600 <= (t-now).total_seconds() <= 18*3600: c+=1
+print(c)")
+            [ "${N:-0}" -eq 0 ] && { echo "skip  $S"; continue; }
+            H=$(mktemp)
+            curl -sS -D "$H" -o "boards/$S.json" \
+              "https://api.the-odds-api.com/v4/sports/$S/odds/?apiKey=$ODDS_KEY&bookmakers=$BOOKS&markets=h2h,spreads,totals&oddsFormat=decimal&dateFormat=iso"
+            [ "$(wc -c < "boards/$S.json")" -lt 200 ] && { echo "FAIL  $S"; rm -f "$H"; continue; }
+            REM=$(grep -i '^x-requests-remaining' "$H" | tr -d '\r' | cut -d' ' -f2-); rm -f "$H"
+            echo "ok    $S ($N soon) rem:$REM"
+            if [ "$ALTS" = "true" ]; then
+              AD="boards/${S}_alt"; mkdir -p "$AD"
+              grep -o '"id":"[a-f0-9]\{32\}"' "boards/$S.json" | cut -d'"' -f4 | sort -u > /tmp/ids
+              i=0
+              while read -r ID; do
+                [ -n "$ID" ] || continue
+                curl -sS -o "$AD/$ID.json" \
+                  "https://api.the-odds-api.com/v4/sports/$S/events/$ID/odds/?apiKey=$ODDS_KEY&bookmakers=$BOOKS&markets=alternate_spreads,alternate_totals&oddsFormat=decimal&dateFormat=iso" &
+                i=$((i+1)); [ $((i % 8)) -eq 0 ] && wait
+              done < /tmp/ids
+              wait
+              echo "      alts: $(ls "$AD"/*.json 2>/dev/null | wc -l)"
+            fi
+          done
+          date -u +%FT%TZ > boards/updated.txt
+          echo "$REM" > boards/credits.txt
+      - name: commit
+        run: |
+          git config user.name  "odds-bot"
+          git config user.email "odds-bot@users.noreply.github.com"
+          git add -A boards
+          git diff --staged --quiet || git commit -m "odds $(date -u +%FT%TZ)"
+          git push
