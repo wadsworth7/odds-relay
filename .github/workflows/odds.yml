@@ -1,11 +1,19 @@
 name: odds
 on:
-  schedule:
-    - cron: '7 14-23,0-5 * * *'
   workflow_dispatch:
     inputs:
+      sport:
+        description: 'which board to pull'
+        type: choice
+        options: [all, nfl, cfb, nba, cbb, nhl, soccer, mma, mlb, custom]
+        default: all
+      custom:
+        description: 'if sport=custom: space-separated API keys (see boards/sports.json)'
+        type: string
+        required: false
+        default: ''
       alts:
-        description: 'also fetch alternate ladders (NFL + NBA)'
+        description: 'also fetch alternate spread/total ladders'
         type: boolean
         default: true
 permissions:
@@ -20,43 +28,68 @@ jobs:
       - name: fetch odds
         env:
           ODDS_KEY: ${{ secrets.ODDS_API_KEY }}
-          ALTS: ${{ github.event_name == 'workflow_dispatch' && inputs.alts || false }}
+          SPORT: ${{ inputs.sport }}
+          CUSTOM: ${{ inputs.custom }}
+          ALTS: ${{ inputs.alts }}
         run: |
           set -uo pipefail
           BOOKS="pinnacle,lowvig,betonlineag,bovada,draftkings,fanduel,betmgm,betrivers"
-          SPORTS="americanfootball_nfl americanfootball_ncaaf basketball_nba basketball_ncaab icehockey_nhl soccer_uefa_nations_league"
-          ALT_SPORTS="americanfootball_nfl basketball_nba"
+          MAXALT=80
           mkdir -p boards
+          curl -sS -o boards/sports.json "https://api.the-odds-api.com/v4/sports/?apiKey=$ODDS_KEY"
+          ALLKEYS=$(grep -o '"key":"[a-z0-9_]*"' boards/sports.json | cut -d'"' -f4 | sort -u)
+          case "$SPORT" in
+            all)    SPORTS=$(echo "$ALLKEYS" | tr '\n' ' ') ;;
+            soccer) SPORTS=$(echo "$ALLKEYS" | grep '^soccer_' | tr '\n' ' ') ;;
+            nfl)    SPORTS="americanfootball_nfl" ;;
+            cfb)    SPORTS="americanfootball_ncaaf" ;;
+            nba)    SPORTS="basketball_nba" ;;
+            cbb)    SPORTS="basketball_ncaab" ;;
+            nhl)    SPORTS="icehockey_nhl" ;;
+            mma)    SPORTS="mma_mixed_martial_arts" ;;
+            mlb)    SPORTS="baseball_mlb" ;;
+            custom) SPORTS="$CUSTOM" ;;
+            *)      SPORTS="$SPORT" ;;
+          esac
+          if [ -z "$(echo $SPORTS | tr -d ' ')" ]; then echo "no sports selected"; exit 1; fi
+          echo "sport=$SPORT  alts=$ALTS  pulling $(echo $SPORTS | wc -w) key(s)"
           REM="?"
+          ALTCOUNT=0
+          PULLED=""
           for S in $SPORTS; do
             H=$(mktemp)
             curl -sS -D "$H" -o "boards/$S.json" \
               "https://api.the-odds-api.com/v4/sports/$S/odds/?apiKey=$ODDS_KEY&bookmakers=$BOOKS&markets=h2h,spreads,totals&oddsFormat=decimal&dateFormat=iso"
             SZ=$(wc -c < "boards/$S.json")
-            if [ "$SZ" -lt 20 ]; then echo "empty $S"; rm -f "boards/$S.json" "$H"; continue; fi
-            if [ "$SZ" -lt 200 ]; then echo "FAIL  $S $(cat boards/$S.json)"; rm -f "boards/$S.json" "$H"; continue; fi
+            if [ "$SZ" -lt 200 ]; then rm -f "boards/$S.json" "$H"; continue; fi
             N=$(grep -o '"id":"[a-f0-9]\{32\}"' "boards/$S.json" | sort -u | wc -l | tr -d ' ')
-            REM=$(grep -i '^x-requests-remaining' "$H" | tr -d '\r' | cut -d' ' -f2-)
+            R2=$(grep -i '^x-requests-remaining' "$H" | tr -d '\r' | cut -d' ' -f2-)
+            if [ -n "$R2" ]; then REM="$R2"; fi
             rm -f "$H"
+            PULLED="$PULLED $S"
             echo "ok    $S  $N games  rem:$REM"
-            case " $ALT_SPORTS " in *" $S "*) ;; *) continue ;; esac
             if [ "$ALTS" != "true" ]; then continue; fi
+            if [ "$ALTCOUNT" -ge "$MAXALT" ]; then echo "      alts skipped (cap $MAXALT reached)"; continue; fi
             AD="boards/${S}_alt"; mkdir -p "$AD"
             grep -o '"id":"[a-f0-9]\{32\}"' "boards/$S.json" | cut -d'"' -f4 | sort -u > ids.txt
             i=0
             while read -r ID; do
               [ -n "$ID" ] || continue
+              if [ "$ALTCOUNT" -ge "$MAXALT" ]; then break; fi
               curl -sS -o "$AD/$ID.json" \
                 "https://api.the-odds-api.com/v4/sports/$S/events/$ID/odds/?apiKey=$ODDS_KEY&bookmakers=$BOOKS&markets=alternate_spreads,alternate_totals&oddsFormat=decimal&dateFormat=iso" &
-              i=$((i+1))
+              i=$((i+1)); ALTCOUNT=$((ALTCOUNT+1))
               if [ $((i % 8)) -eq 0 ]; then wait; fi
             done < ids.txt
             wait
             rm -f ids.txt
-            echo "      alts: $(ls "$AD" | wc -l | tr -d ' ')"
+            echo "      alts: $(ls "$AD" | wc -l | tr -d ' ')  (running total $ALTCOUNT)"
           done
           date -u +%FT%TZ > boards/updated.txt
           echo "$REM" > boards/credits.txt
+          echo "$SPORT" > boards/mode.txt
+          echo "$PULLED" | tr ' ' '\n' | grep . > boards/pulled.txt || true
+          echo "done. credits remaining: $REM"
       - name: commit
         run: |
           git config user.name "odds-bot"
